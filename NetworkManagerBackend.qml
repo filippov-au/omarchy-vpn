@@ -58,6 +58,11 @@ Item {
   // advice for someone who has the tools and only lacks a profile.
   readonly property string setupHint: _toolsPresent && profiles.length === 0 ? emptyText : ""
   property int _desired: -1
+  property bool statusKnown: false
+  property int statusGeneration: 0
+  readonly property bool connectionPending: _desired !== -1
+  readonly property bool mayBeConnected: _activeNow || _desired === 1
+  readonly property string connectionState: Shared.connectionState(statusKnown, _activeNow, _desired)
   property var _pendingTarget: null
   // Connecting can take two commands — down the profile that is up, then up the
   // one that was asked for. "" when nothing is in flight.
@@ -70,7 +75,7 @@ Item {
   signal authRequired(string command)
 
   readonly property bool _activeNow: NetworkManager.activeNmProfile(profiles) !== null
-  readonly property bool connected: _desired === -1 ? _activeNow : (_desired === 1)
+  readonly property bool connected: connectionState === "connected"
   readonly property bool _working: connectProcess.running || chainTimer.running || _stage !== ""
   readonly property bool busy: _working || listProcess.running || typesProcess.running
   readonly property string summary: NetworkManager.nmSummary(profiles)
@@ -150,6 +155,9 @@ Item {
       return
     }
 
+    settleTimer.stop()
+    statusGeneration += 1
+    statusKnown = false
     _desired = 1
     _pendingTarget = target
     lastError = ""
@@ -165,10 +173,10 @@ Item {
     var active = NetworkManager.activeNmProfile(profiles)
     if (active && active.uuid !== target.uuid) {
       _stage = "handover"
-      connectProcess.command = ["nmcli", "connection", "down", "uuid", active.uuid]
+      connectProcess.execCommand = ["nmcli", "connection", "down", "uuid", active.uuid]
     } else {
       _stage = "final"
-      connectProcess.command = root.activation(target)
+      connectProcess.execCommand = root.activation(target)
     }
     connectProcess.running = true
   }
@@ -188,7 +196,7 @@ Item {
       return
     }
     root._stage = "final"
-    connectProcess.command = root.activation(target)
+    connectProcess.execCommand = root.activation(target)
     connectProcess.running = true
   }
 
@@ -202,16 +210,19 @@ Item {
     var active = NetworkManager.activeNmProfile(profiles)
     if (!active) return
 
+    settleTimer.stop()
+    statusGeneration += 1
+    statusKnown = false
     _desired = 0
     _stage = "final"
     lastError = ""
     actionStatus = "Disconnecting…"
-    connectProcess.command = ["nmcli", "connection", "down", "uuid", active.uuid]
+    connectProcess.execCommand = ["nmcli", "connection", "down", "uuid", active.uuid]
     connectProcess.running = true
   }
 
   function toggleConnection() {
-    if (connected) {
+    if (mayBeConnected) {
       disconnect()
       return
     }
@@ -239,7 +250,8 @@ Item {
     }
 
     root.profiles = eligible
-    if (_desired !== -1 && (NetworkManager.activeNmProfile(eligible) !== null) === (_desired === 1)) _desired = -1
+    root.statusKnown = true
+    if (!_working && _desired !== -1 && (NetworkManager.activeNmProfile(eligible) !== null) === (_desired === 1)) _desired = -1
   }
 
   Timer {
@@ -276,9 +288,10 @@ Item {
     }
   }
 
-  Process {
+  VpnProcess {
     id: nmcliProbe
-    command: ["omarchy-cmd-present", "nmcli"]
+    objectName: "nmcliProbe"
+    execCommand: ["omarchy-cmd-present", "nmcli"]
     running: true
     onExited: function(exitCode) {
       root._nmcliPresent = exitCode === 0
@@ -286,9 +299,10 @@ Item {
     }
   }
 
-  Process {
+  VpnProcess {
     id: openvpnProbe
-    command: ["omarchy-cmd-present", "openvpn"]
+    objectName: "openvpnProbe"
+    execCommand: ["omarchy-cmd-present", "openvpn"]
     running: true
     onExited: function(exitCode) {
       root._openvpnPresent = exitCode === 0
@@ -299,9 +313,10 @@ Item {
   // `wg` comes with wireguard-tools. The kernel module is what actually carries
   // the tunnel, but NetworkManager loads that itself, and a box with the tools
   // installed is a box where a WireGuard profile is meant to work.
-  Process {
+  VpnProcess {
     id: wireguardProbe
-    command: ["omarchy-cmd-present", "wg"]
+    objectName: "wireguardProbe"
+    execCommand: ["omarchy-cmd-present", "wg"]
     running: true
     onExited: function(exitCode) {
       root._wireguardPresent = exitCode === 0
@@ -314,9 +329,10 @@ Item {
   // that lives. The helper is asked, so the search exists in one place rather
   // than being restated as a path here that could drift out of agreement with
   // the connect that depends on it.
-  Process {
+  VpnProcess {
     id: openconnectProbe
-    command: [root.openconnectAuth, "--dialog-path"]
+    objectName: "openconnectProbe"
+    execCommand: [root.openconnectAuth, "--dialog-path"]
     running: true
     onExited: function(exitCode) {
       root._openconnectPresent = exitCode === 0
@@ -327,9 +343,10 @@ Item {
   // NetworkManager's VPNC service is deliberately not on PATH. Distributions
   // put it in lib or libexec, so checking the carrier itself is more accurate
   // than checking for the standalone `vpnc` client a profile does not invoke.
-  Process {
+  VpnProcess {
     id: vpncProbe
-    command: ["sh", "-c", [
+    objectName: "vpncProbe"
+    execCommand: ["sh", "-c", [
       "test -x /usr/lib/nm-vpnc-service",
       "test -x /usr/libexec/nm-vpnc-service",
       "test -x /usr/lib/NetworkManager/nm-vpnc-service",
@@ -345,9 +362,10 @@ Item {
   // Same reasoning as VPNC: the L2TP carrier is the NetworkManager service, not
   // the xl2tpd and pppd binaries it drives, and distributions disagree on where
   // it lands.
-  Process {
+  VpnProcess {
     id: l2tpProbe
-    command: ["sh", "-c", [
+    objectName: "l2tpProbe"
+    execCommand: ["sh", "-c", [
       "test -x /usr/lib/nm-l2tp-service",
       "test -x /usr/libexec/nm-l2tp-service",
       "test -x /usr/lib/NetworkManager/nm-l2tp-service",
@@ -386,14 +404,18 @@ Item {
   // Every tunnel-shaped connection: `vpn` whichever plugin backs it, plus
   // `wireguard`, which NetworkManager types as its own thing rather than as a
   // VPN plugin.
-  Process {
+  VpnProcess {
     id: listProcess
+    objectName: "listProcess"
+    property int requestGeneration: -1
+    onStarted: requestGeneration = root.statusGeneration
     running: false
-    command: root._listCommand
+    execCommand: root._listCommand
     stdout: StdioCollector { id: listStdout; waitForEnd: true }
     stderr: StdioCollector { id: listStderr; waitForEnd: true }
     property var pending: []
     onExited: function(exitCode) {
+      if (listProcess.requestGeneration !== root.statusGeneration) return
       if (exitCode !== 0) {
         var failure = String(listStderr.text || "")
         if (root._filenameField && root.unknownField(failure)) {
@@ -402,6 +424,7 @@ Item {
           return
         }
         root.lastError = Shared.elide(failure || "Could not list NetworkManager connections", 140)
+        root.statusKnown = false
         return
       }
 
@@ -429,24 +452,29 @@ Item {
         return
       }
 
-      typesProcess.command = command
+      typesProcess.execCommand = command
       typesProcess.running = true
     }
   }
 
-  Process {
+  VpnProcess {
     id: typesProcess
+    objectName: "typesProcess"
+    property int requestGeneration: -1
+    onStarted: requestGeneration = listProcess.requestGeneration
     running: false
-    command: []
+    execCommand: []
     stdout: StdioCollector { id: typesStdout; waitForEnd: true }
     stderr: StdioCollector { id: typesStderr; waitForEnd: true }
     onExited: function(exitCode) {
+      if (typesProcess.requestGeneration !== root.statusGeneration) return
       // One profile deleted between the two passes fails the whole call. That
       // is a reason to keep the list from last time, not to declare the machine
       // has no tunnels: emptying it here drops `detected`, takes the chip away
       // while a tunnel is up, and with it the only way to bring that tunnel
       // down — disconnect() refuses to run undetected.
       if (exitCode !== 0) {
+        root.statusKnown = false
         root.lastError = Shared.elide(
           String(typesStderr.text || "") || "Could not read NetworkManager profile details", 140)
         return
@@ -490,19 +518,20 @@ Item {
     }
   }
 
-  Process {
+  VpnProcess {
     id: connectProcess
+    objectName: "connectProcess"
+    timeoutSeconds: root._pendingTarget && root._pendingTarget.kind === "openconnect" ? 0 : 180
     running: false
-    command: []
+    execCommand: []
     stdout: StdioCollector { id: connectStdout; waitForEnd: true }
     stderr: StdioCollector { id: connectStderr; waitForEnd: true }
     onExited: function(exitCode) {
       var output = String(connectStderr.text || "") + "\n" + String(connectStdout.text || "")
 
-      // The old tunnel is down (or refused to come down, which is not a reason
-      // to swallow the connect the user asked for). Either way, bring up the
-      // one they picked.
-      if (root._stage === "handover") {
+      // Activate the next profile only after a successful teardown. A refusal
+      // must not turn a handover into two competing tunnels.
+      if (root._stage === "handover" && exitCode === 0) {
         root._stage = ""
         chainTimer.restart()
         return

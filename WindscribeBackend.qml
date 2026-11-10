@@ -76,11 +76,15 @@ Item {
   // Which switch is in flight, so a refusal rolls back the right one.
   property string _toggleKey: ""
 
-  // Optimistic connection state so the switch flips the instant you click it.
-  // -1 follows the app, 0/1 while a connect/disconnect is still in flight.
+  // Requested state is kept separate from observations; it never confirms a tunnel.
   property int _desired: -1
+  property bool statusKnown: false
+  property int statusGeneration: 0
+  readonly property bool connectionPending: _desired !== -1
+  readonly property bool mayBeConnected: status.connected || _desired === 1
+  readonly property string connectionState: Shared.connectionState(statusKnown, status.connected, _desired)
 
-  readonly property bool connected: _desired === -1 ? status.connected : (_desired === 1)
+  readonly property bool connected: connectionState === "connected"
   readonly property bool busy: _running !== "" || _queue.length > 0
   readonly property string summary: Windscribe.windscribeSummary(status)
   readonly property var details: Windscribe.windscribeDetails(status)
@@ -156,9 +160,8 @@ Item {
     var job = queue.shift()
     _queue = queue
     _current = job
-    cliProcess.command = ["windscribe-cli"].concat(job.args)
+    cliProcess.execCommand = ["windscribe-cli"].concat(job.args)
     cliProcess.running = true
-    stallTimer.restart()
   }
 
   // Starting the next job from inside onExited would re-enter the process that
@@ -184,15 +187,6 @@ Item {
   // this widget as well as this one — while `pump` refused to start anything
   // behind it. Killing it makes `onExited` fire, which does the bookkeeping by
   // the usual path. Nothing this CLI does takes half a minute.
-  Timer {
-    id: stallTimer
-    interval: 30000
-    repeat: false
-    onTriggered: {
-      root._current = null
-      cliProcess.running = false
-    }
-  }
 
   // ------------------------------------------------------------ the verbs
 
@@ -271,6 +265,9 @@ Item {
   // say. The settle timer polls for the outcome instead.
   function connectTo(target) {
     if (!detected || _actionPending || !target) return
+    settleTimer.stop()
+    statusGeneration += 1
+    statusKnown = false
     _desired = 1
     lastError = ""
     actionStatus = "Connecting to " + target.label + "…"
@@ -280,6 +277,9 @@ Item {
 
   function disconnect() {
     if (!detected || _actionPending) return
+    settleTimer.stop()
+    statusGeneration += 1
+    statusKnown = false
     _desired = 0
     lastError = ""
     actionStatus = "Disconnecting…"
@@ -288,7 +288,7 @@ Item {
   }
 
   function toggleConnection() {
-    if (connected) disconnect()
+    if (mayBeConnected) disconnect()
     else connectTo({ label: "the best location", args: ["best"] })
   }
 
@@ -297,13 +297,14 @@ Item {
   function applyStatus(raw) {
     var parsed = Windscribe.parseWindscribeStatus(raw)
     root.status = parsed
+    root.statusKnown = true
 
     // An accepted-then-failed connect is reported nowhere but here, so the
     // optimistic switch has to be dropped on sight of it. Left alone it would
     // stay on "connected" until the settle timer gave up, which is the widget
     // vouching for a tunnel that never came up.
     if (parsed.state === "error") root._desired = -1
-    else if (root._desired !== -1 && parsed.connected === (root._desired === 1)) root._desired = -1
+    else if (root._actionPending === false && root._desired !== -1 && parsed.connected === (root._desired === 1)) root._desired = -1
 
     // The CLI's error state is sticky — it stands until the next successful
     // connect — so this both raises the failure and clears it, rather than
@@ -371,9 +372,10 @@ Item {
 
   // The only call that does not go through the queue, because it is not the
   // Windscribe CLI: `omarchy-cmd-present` takes no lock and answers instantly.
-  Process {
+  VpnProcess {
     id: presenceProbe
-    command: ["omarchy-cmd-present", "windscribe-cli"]
+    objectName: "presenceProbe"
+    execCommand: ["omarchy-cmd-present", "windscribe-cli"]
     running: true
     onExited: function(exitCode) {
       root._probed = true
@@ -384,10 +386,14 @@ Item {
     }
   }
 
-  Process {
+  VpnProcess {
     id: cliProcess
+    objectName: "cliProcess"
+    property int requestGeneration: -1
+    onStarted: requestGeneration = root.statusGeneration
+    timeoutSeconds: 30
     running: false
-    command: []
+    execCommand: []
     stdout: StdioCollector { id: cliStdout; waitForEnd: true }
     stderr: StdioCollector { id: cliStderr; waitForEnd: true }
     onExited: function(exitCode) {
@@ -396,7 +402,6 @@ Item {
       var out = String(cliStdout.text || "")
       var err = String(cliStderr.text || "")
 
-      stallTimer.stop()
       root._current = null
 
       // Somebody else had the lock. Nothing was read and nothing was done, so
@@ -404,7 +409,9 @@ Item {
       // somebody is this same widget on another monitor.
       if (job && root.cliLocked(out, err) && root.retry(job)) return
 
-      if (kind === "status") root.finishStatus(exitCode, out, err)
+      if (kind === "status") {
+        if (cliProcess.requestGeneration === root.statusGeneration) root.finishStatus(exitCode, out, err)
+      }
       else if (kind === "locations") root.finishLocations(exitCode, out, err)
       else if (kind === "toggle") root.finishToggle(exitCode, out, err)
       else if (kind !== "") root.finishAction(exitCode, out, err)
@@ -421,6 +428,7 @@ Item {
     var parsed = Windscribe.parseWindscribeStatus(out)
 
     if (exitCode !== 0 || !parsed.loaded) {
+      root.statusKnown = false
       if (root.cliLocked(out, err)) return
 
       // Nothing recognizable came back: the app is not running, or this is a

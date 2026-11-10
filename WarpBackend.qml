@@ -60,11 +60,15 @@ Item {
   // What the panel runs in a terminal when that hint is clicked.
   readonly property string setupCommand: Warp.warpSetupCommand(_probe)
 
-  // Optimistic connection state so the switch flips the instant you click it.
-  // -1 follows warp-svc, 0/1 while a connect/disconnect is still in flight.
+  // Requested state is kept separate from observations; it never confirms a tunnel.
   property int _desired: -1
+  property bool statusKnown: false
+  property int statusGeneration: 0
+  readonly property bool connectionPending: _desired !== -1
+  readonly property bool mayBeConnected: status.connected || _desired === 1
+  readonly property string connectionState: Shared.connectionState(statusKnown, status.connected, _desired)
 
-  readonly property bool connected: _desired === -1 ? status.connected : (_desired === 1)
+  readonly property bool connected: connectionState === "connected"
   readonly property bool _working: commandProcess.running || chainTimer.running || _stage !== ""
   readonly property bool busy: _working || statusProcess.running
   readonly property string summary: Warp.warpSummary(status, stats, registration)
@@ -92,6 +96,9 @@ Item {
   function connectTo(target) {
     if (!detected || _working || !target) return
 
+    settleTimer.stop()
+    statusGeneration += 1
+    statusKnown = false
     _desired = 1
     _pendingTarget = target
     lastError = ""
@@ -106,6 +113,9 @@ Item {
 
   function disconnect() {
     if (!detected || _working) return
+    settleTimer.stop()
+    statusGeneration += 1
+    statusKnown = false
     _desired = 0
     lastError = ""
     actionStatus = "Disconnecting…"
@@ -114,12 +124,15 @@ Item {
 
   // WARP's own default: `connect` with whichever mode is already set.
   function toggleConnection() {
-    if (connected) {
+    if (mayBeConnected) {
       disconnect()
       return
     }
     if (!detected || _working) return
 
+    settleTimer.stop()
+    statusGeneration += 1
+    statusKnown = false
     _desired = 1
     _pendingTarget = null
     lastError = ""
@@ -129,7 +142,7 @@ Item {
 
   function runStage(stage, args) {
     root._stage = stage
-    commandProcess.command = ["warp-cli"].concat(args)
+    commandProcess.execCommand = ["warp-cli"].concat(args)
     commandProcess.running = true
   }
 
@@ -137,13 +150,19 @@ Item {
     var parsed = Warp.parseWarpStatus(raw)
     // An answer that does not parse is not news. Keep the last reading, so a
     // hiccup cannot report a live tunnel as down.
-    if (parsed.state === "") return
+    if (parsed.state === "") {
+      root.statusKnown = false
+      root.lastError = "Could not read WARP status"
+      return false
+    }
     root.status = parsed
-    if (_desired !== -1 && parsed.connected === (_desired === 1)) _desired = -1
+    root.statusKnown = true
+    if (!_working && _desired !== -1 && parsed.connected === (_desired === 1)) _desired = -1
     // Stats are only meaningful with a tunnel up; while down warp-cli answers
     // with an error object, which would only replace good numbers with none.
     if (parsed.connected && !statsProcess.running) statsProcess.running = true
     if (!parsed.connected) root.stats = Warp.parseWarpStats("")
+    return true
   }
 
   // The service applies connect and disconnect a beat after the command
@@ -176,9 +195,10 @@ Item {
     onTriggered: root.runStage("connect", ["connect"])
   }
 
-  Process {
+  VpnProcess {
     id: presenceProcess
-    command: ["omarchy-cmd-present", "warp-cli"]
+    objectName: "presenceProcess"
+    execCommand: ["omarchy-cmd-present", "warp-cli"]
     running: true
     onExited: function(exitCode) {
       root._present = exitCode === 0
@@ -189,10 +209,11 @@ Item {
 
   // Answers "registered" and, on the way, whether the terms were ever accepted
   // and whether the service is up — the three things setupHint distinguishes.
-  Process {
+  VpnProcess {
     id: registrationProcess
+    objectName: "registrationProcess"
     running: false
-    command: ["warp-cli", "--json", "registration", "show"]
+    execCommand: ["warp-cli", "--json", "registration", "show"]
     stdout: StdioCollector { id: registrationStdout; waitForEnd: true }
     stderr: StdioCollector { id: registrationStderr; waitForEnd: true }
     onExited: function(exitCode) {
@@ -213,28 +234,33 @@ Item {
     }
   }
 
-  Process {
+  VpnProcess {
     id: statusProcess
+    objectName: "statusProcess"
+    property int requestGeneration: -1
+    onStarted: requestGeneration = root.statusGeneration
     running: false
-    command: ["warp-cli", "--json", "status"]
+    execCommand: ["warp-cli", "--json", "status"]
     stdout: StdioCollector { id: statusStdout; waitForEnd: true }
     stderr: StdioCollector { id: statusStderr; waitForEnd: true }
     onExited: function(exitCode) {
+      if (statusProcess.requestGeneration !== root.statusGeneration) return
       var output = String(statusStdout.text || "") + "\n" + String(statusStderr.text || "")
       if (!Warp.warpCommandFailed(exitCode, output)) {
-        root.applyStatus(String(statusStdout.text || ""))
-        if (root._stage === "") root.lastError = ""
+        if (root.applyStatus(String(statusStdout.text || "")) && root._stage === "") root.lastError = ""
         return
       }
       // Stale, not empty: say what went wrong and leave the last reading up.
+      root.statusKnown = false
       root.lastError = Warp.describeWarpFailure(output, "Could not read WARP status")
     }
   }
 
-  Process {
+  VpnProcess {
     id: settingsProcess
+    objectName: "settingsProcess"
     running: false
-    command: ["warp-cli", "--json", "settings", "list"]
+    execCommand: ["warp-cli", "--json", "settings", "list"]
     stdout: StdioCollector { id: settingsStdout; waitForEnd: true }
     onExited: function(exitCode) {
       if (exitCode !== 0) return
@@ -243,10 +269,11 @@ Item {
     }
   }
 
-  Process {
+  VpnProcess {
     id: statsProcess
+    objectName: "statsProcess"
     running: false
-    command: ["warp-cli", "--json", "tunnel", "stats"]
+    execCommand: ["warp-cli", "--json", "tunnel", "stats"]
     stdout: StdioCollector { id: statsStdout; waitForEnd: true }
     onExited: function(exitCode) {
       if (exitCode !== 0) return
@@ -255,10 +282,12 @@ Item {
     }
   }
 
-  Process {
+  VpnProcess {
     id: commandProcess
+    objectName: "commandProcess"
+    timeoutSeconds: 180
     running: false
-    command: []
+    execCommand: []
     stdout: StdioCollector { id: commandStdout; waitForEnd: true }
     stderr: StdioCollector { id: commandStderr; waitForEnd: true }
     onExited: function(exitCode) {

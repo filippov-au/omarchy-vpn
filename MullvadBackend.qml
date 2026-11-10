@@ -45,11 +45,15 @@ Item {
   readonly property var toggles: Shared.applyPendingToggles(Mullvad.mullvadToggles(daemonSettings), _pendingToggles)
   property var _pendingToggles: ({})
 
-  // Optimistic connection state so the switch flips the instant you click it.
-  // -1 follows the daemon, 0/1 while a connect/disconnect is still in flight.
+  // Requested state is kept separate from observations; it never confirms a tunnel.
   property int _desired: -1
+  property bool statusKnown: false
+  property int statusGeneration: 0
+  readonly property bool connectionPending: _desired !== -1
+  readonly property bool mayBeConnected: status.connected || _desired === 1
+  readonly property string connectionState: Shared.connectionState(statusKnown, status.connected, _desired)
 
-  readonly property bool connected: _desired === -1 ? status.connected : (_desired === 1)
+  readonly property bool connected: connectionState === "connected"
   // A connect spans two processes with an event-loop hop between them, so
   // "running" alone would leave a gap a second click could slip through.
   readonly property bool _working: commandProcess.running || chainTimer.running || _stage !== ""
@@ -107,7 +111,7 @@ Item {
 
     lastError = ""
     _toggleKey = key
-    toggleProcess.command = ["mullvad"].concat(args)
+    toggleProcess.execCommand = ["mullvad"].concat(args)
     toggleProcess.running = true
     pendingTimer.restart()
   }
@@ -146,6 +150,9 @@ Item {
   function connectTo(target) {
     if (!detected || _working || !target) return
 
+    settleTimer.stop()
+    statusGeneration += 1
+    statusKnown = false
     _desired = 1
     _pendingTarget = target
     lastError = ""
@@ -155,6 +162,9 @@ Item {
 
   function disconnect() {
     if (!detected || _working) return
+    settleTimer.stop()
+    statusGeneration += 1
+    statusKnown = false
     _desired = 0
     lastError = ""
     actionStatus = "Disconnecting…"
@@ -164,12 +174,15 @@ Item {
   // Mullvad has no notion of a fastest server: `connect` uses the relay
   // constraint already stored, which is whatever was picked last.
   function toggleConnection() {
-    if (connected) {
+    if (mayBeConnected) {
       disconnect()
       return
     }
     if (!detected || _working) return
 
+    settleTimer.stop()
+    statusGeneration += 1
+    statusKnown = false
     _desired = 1
     _pendingTarget = null
     lastError = ""
@@ -179,15 +192,22 @@ Item {
 
   function runStage(stage, args) {
     root._stage = stage
-    commandProcess.command = ["mullvad"].concat(args)
+    commandProcess.execCommand = ["mullvad"].concat(args)
     commandProcess.running = true
   }
 
   function applyStatus(raw) {
     var parsed = Mullvad.parseMullvadStatus(raw)
+    if (["connected", "disconnected", "connecting", "disconnecting", "error"].indexOf(parsed.state) === -1) {
+      root.statusKnown = false
+      root.lastError = "Could not read Mullvad status"
+      return false
+    }
     root.status = parsed
+    root.statusKnown = true
     // Reality caught up with the pending connect/disconnect — stop overriding.
-    if (_desired !== -1 && parsed.connected === (_desired === 1)) _desired = -1
+    if (!_working && _desired !== -1 && parsed.connected === (_desired === 1)) _desired = -1
+    return true
   }
 
   function describeFailure(output, fallback) {
@@ -251,9 +271,10 @@ Item {
     onTriggered: root.runStage("connect", ["connect"])
   }
 
-  Process {
+  VpnProcess {
     id: detectProcess
-    command: ["omarchy-cmd-present", "mullvad"]
+    objectName: "detectProcess"
+    execCommand: ["omarchy-cmd-present", "mullvad"]
     running: true
     onExited: function(exitCode) {
       root._probed = true
@@ -262,18 +283,23 @@ Item {
     }
   }
 
-  Process {
+  VpnProcess {
     id: statusProcess
+    objectName: "statusProcess"
+    property int requestGeneration: -1
+    onStarted: requestGeneration = root.statusGeneration
     running: false
-    command: ["mullvad", "status", "-j"]
+    execCommand: ["mullvad", "status", "-j"]
     stdout: StdioCollector { id: statusStdout; waitForEnd: true }
     stderr: StdioCollector { id: statusStderr; waitForEnd: true }
     onExited: function(exitCode) {
+      if (statusProcess.requestGeneration !== root.statusGeneration) return
       if (exitCode === 0) {
-        root.applyStatus(String(statusStdout.text || ""))
-        root.lastError = ""
+        if (root.applyStatus(String(statusStdout.text || ""))) root.lastError = ""
         return
       }
+
+      root.statusKnown = false
 
       // Installed but unusable is its own state: keep the tool listed and say
       // what to do about it rather than quietly dropping off the switcher.
@@ -290,20 +316,22 @@ Item {
   // The exit code belongs to the last subcommand alone and says nothing about
   // the other two, so it is not consulted: the parser reads whichever answers
   // arrived and reports the rest as unanswered rather than as off.
-  Process {
+  VpnProcess {
     id: settingsProcess
+    objectName: "settingsProcess"
     running: false
-    command: ["bash", "-c", "mullvad auto-connect get; mullvad lockdown-mode get; mullvad lan get"]
+    execCommand: ["bash", "-c", "mullvad auto-connect get; mullvad lockdown-mode get; mullvad lan get"]
     stdout: StdioCollector { id: settingsStdout; waitForEnd: true }
     onExited: function(exitCode) {
       root.applySettings(String(settingsStdout.text || ""))
     }
   }
 
-  Process {
+  VpnProcess {
     id: toggleProcess
+    objectName: "toggleProcess"
     running: false
-    command: []
+    execCommand: []
     stdout: StdioCollector { id: toggleStdout; waitForEnd: true }
     stderr: StdioCollector { id: toggleStderr; waitForEnd: true }
     onExited: function(exitCode) {
@@ -322,10 +350,11 @@ Item {
   // "asked and answered", not "answered with something". Keying it off the
   // parsed count made a format change re-fetch the whole list on every poll,
   // forever, while the panel showed no countries and no reason why.
-  Process {
+  VpnProcess {
     id: relaysProcess
+    objectName: "relaysProcess"
     running: false
-    command: ["mullvad", "relay", "list"]
+    execCommand: ["mullvad", "relay", "list"]
     stdout: StdioCollector { id: relaysStdout; waitForEnd: true }
     stderr: StdioCollector { id: relaysStderr; waitForEnd: true }
     onExited: function(exitCode) {
@@ -344,10 +373,12 @@ Item {
     }
   }
 
-  Process {
+  VpnProcess {
     id: commandProcess
+    objectName: "commandProcess"
+    timeoutSeconds: 180
     running: false
-    command: []
+    execCommand: []
     stdout: StdioCollector { id: commandStdout; waitForEnd: true }
     stderr: StdioCollector { id: commandStderr; waitForEnd: true }
     onExited: function(exitCode) {

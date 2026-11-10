@@ -89,8 +89,11 @@ Item {
     if (!anyDetected) {
       return detectedBackends.length > 0 ? "Every VPN tool is hidden" : "No VPN tool installed"
     }
+    var pending = availableBackends.filter(function(candidate) { return candidate.connectionPending })
+    if (pending.length > 0) return pending[0].label + " · " + pending[0].connectionState
     var backend = connectedBackend
-    if (!backend) return "Not connected"
+    if (!backend) return availableBackends.some(function(candidate) { return !candidate.statusKnown })
+      ? "Connection status unavailable" : "Not connected"
     return backend.label + " · " + backend.summary
   }
 
@@ -117,6 +120,10 @@ Item {
   property string publicIp: ""
   property bool ipFetching: false
   property bool ipFailed: false
+  readonly property bool publicIpLookup: Shared.publicIpEnabled(setting("publicIpLookup", "off"))
+  property int _ipGeneration: 0
+  property int _ipRequestGeneration: -1
+  property string _ipRequestKey: ""
 
   // Identifies the tunnel currently carrying traffic. Any change to it — a
   // connect, a disconnect, a server switch — means the exit address changed,
@@ -126,16 +133,28 @@ Item {
     return backend ? backend.backendId + "|" + backend.summary : "direct"
   }
 
-  onConnectionKeyChanged: ipSettle.restart()
+  onConnectionKeyChanged: invalidatePublicIp()
+  onPublicIpLookupChanged: invalidatePublicIp()
 
   // A shell restart inherits whatever tunnel was already up, so no change ever
   // fires. One request at startup gives the bar tooltip something to say.
-  Component.onCompleted: ipSettle.restart()
+  Component.onCompleted: invalidatePublicIp()
+
+  function invalidatePublicIp() {
+    _ipGeneration += 1
+    publicIp = ""
+    ipFailed = false
+    ipSettle.stop()
+    if (publicIpLookup) ipSettle.restart()
+  }
 
   function refreshPublicIp() {
-    if (ipProcess.running) return
+    if (!publicIpLookup || ipProcess.running) return
+    publicIp = ""
     ipFetching = true
     ipFailed = false
+    _ipRequestGeneration = _ipGeneration
+    _ipRequestKey = connectionKey
     ipProcess.running = true
   }
 
@@ -153,18 +172,25 @@ Item {
   // VPN is run against — could hand back any address they liked and have the
   // panel present it as proof the tunnel works. `--fail` keeps an error body
   // out of the answer; the parser rejects anything that is not an address.
-  Process {
+  VpnProcess {
     id: ipProcess
+    objectName: "ipProcess"
     running: false
-    command: ["curl", "--silent", "--fail", "--max-time", "6", "https://checkip.amazonaws.com"]
+    execCommand: ["curl", "--proto", "=https", "--silent", "--fail", "--max-time", "6", "--max-filesize", "128", "https://checkip.amazonaws.com"]
     stdout: StdioCollector { id: ipStdout; waitForEnd: true }
     onExited: function(exitCode) {
       root.ipFetching = false
+      if (root._ipRequestGeneration !== root._ipGeneration
+          || !Shared.acceptPublicIpResult(root.publicIpLookup, root._ipRequestKey, root.connectionKey)) {
+        if (root.publicIpLookup) ipSettle.restart()
+        return
+      }
       var address = Shared.parsePublicIp(String(ipStdout.text || ""))
       if (exitCode === 0 && address !== "") {
         root.publicIp = address
         root.ipFailed = false
       } else {
+        root.publicIp = ""
         root.ipFailed = true
       }
     }
@@ -214,7 +240,7 @@ Item {
   function toggleActive() {
     var backend = root.active
     if (!backend) return
-    if (backend.connected) {
+    if (backend.mayBeConnected) {
       disconnectActive()
       return
     }
@@ -289,6 +315,7 @@ Item {
           + (undo !== "" ? " Turn it off with: " + undo : ""))
       }
       others[i].disconnect()
+      others[i].refresh()
     }
     // Picking a second target while the first is still waiting means the second
     // one: nobody clicks two countries wanting both. The deadline stays where
@@ -303,7 +330,8 @@ Item {
 
   function otherConnected(backend) {
     return availableBackends.filter(function(candidate) {
-      return candidate !== backend && candidate.connected
+      return candidate !== backend
+        && !Shared.canStartExclusive([candidate])
     })
   }
 
@@ -312,10 +340,11 @@ Item {
 
   // The backends report their new state through their own polling, so wait for
   // them to actually report down rather than assuming the disconnect landed.
-  // Giving up after ~10s still runs the action: a stuck teardown should not
-  // silently swallow the connect the user asked for.
+  // After ~10s cancel with a notice. A stale or failed teardown is not
+  // permission to start another tunnel.
   Timer {
     id: exclusiveWait
+    objectName: "exclusiveWait"
     property int ticks: 0
     interval: 700
     repeat: true
@@ -325,11 +354,17 @@ Item {
       var action = root._pendingAction
       if (!action) { exclusiveWait.running = false; return }
 
-      if (root.otherConnected(root._pendingBackend).length === 0 || ticks >= 15) {
+      if (root.otherConnected(root._pendingBackend).length === 0) {
         exclusiveWait.running = false
         root._pendingAction = null
         root._pendingBackend = null
         action()
+      } else if (ticks >= 15) {
+        root.cancelPending()
+        root.setNotice("Could not confirm the previous VPN disconnected. Connection cancelled; refresh status and try again.")
+      } else {
+        var others = root.otherConnected(root._pendingBackend)
+        for (var i = 0; i < others.length; i++) others[i].refresh()
       }
     }
   }

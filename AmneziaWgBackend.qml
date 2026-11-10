@@ -52,6 +52,11 @@ Item {
   // -1 follows reality, 0/1 overrides it while a command is in flight, so the
   // switch flips the instant it is clicked instead of waiting a poll cycle.
   property int _desired: -1
+  property bool statusKnown: false
+  property int statusGeneration: 0
+  readonly property bool connectionPending: _desired !== -1
+  readonly property bool mayBeConnected: _activeNow || _desired === 1
+  readonly property string connectionState: Shared.connectionState(statusKnown, _activeNow, _desired)
   property var _pendingTarget: null
   // "" when nothing is in flight, "handover" while the old tunnel is being
   // taken down, "final" while the picked one comes up.
@@ -68,7 +73,7 @@ Item {
   // counts, which is what keeps the chip there to take it down again.
   readonly property bool detected: _toolsPresent && profiles.length > 0
   readonly property bool _activeNow: AmneziaWg.activeAwgProfile(profiles) !== null
-  readonly property bool connected: _desired === -1 ? _activeNow : (_desired === 1)
+  readonly property bool connected: connectionState === "connected"
   readonly property bool _working: connectProcess.running || chainTimer.running || _stage !== ""
   readonly property bool busy: _working || listProcess.running || statusProcess.running
   readonly property string summary: AmneziaWg.awgSummary(profiles)
@@ -137,6 +142,9 @@ Item {
       return
     }
 
+    settleTimer.stop()
+    statusGeneration += 1
+    statusKnown = false
     _desired = 1
     _pendingTarget = target
     lastError = ""
@@ -149,10 +157,10 @@ Item {
     var active = AmneziaWg.activeAwgProfile(profiles)
     if (active && active.confFile !== target.confFile) {
       _stage = "handover"
-      connectProcess.command = root.elevate(["down", active.confFile])
+      connectProcess.execCommand = root.elevate(["down", active.confFile])
     } else {
       _stage = "final"
-      connectProcess.command = root.elevate(["up", target.confFile])
+      connectProcess.execCommand = root.elevate(["up", target.confFile])
     }
     connectProcess.running = true
   }
@@ -163,16 +171,19 @@ Item {
     var active = AmneziaWg.activeAwgProfile(profiles)
     if (!active) return
 
+    settleTimer.stop()
+    statusGeneration += 1
+    statusKnown = false
     _desired = 0
     _stage = "final"
     lastError = ""
     actionStatus = "Disconnecting…"
-    connectProcess.command = root.elevate(["down", active.confFile])
+    connectProcess.execCommand = root.elevate(["down", active.confFile])
     connectProcess.running = true
   }
 
   function toggleConnection() {
-    if (connected) {
+    if (mayBeConnected) {
       disconnect()
       return
     }
@@ -192,7 +203,7 @@ Item {
   function applyProfiles(entries) {
     var list = AmneziaWg.buildProfiles(entries, root.upInterfaces)
     root.profiles = list
-    if (_desired !== -1 && (AmneziaWg.activeAwgProfile(list) !== null) === (_desired === 1)) _desired = -1
+    if (!_working && _desired !== -1 && (AmneziaWg.activeAwgProfile(list) !== null) === (_desired === 1)) _desired = -1
   }
 
   Timer {
@@ -202,9 +213,10 @@ Item {
     onTriggered: root.actionStatus = ""
   }
 
-  Process {
+  VpnProcess {
     id: awgProbe
-    command: ["omarchy-cmd-present", "awg"]
+    objectName: "awgProbe"
+    execCommand: ["omarchy-cmd-present", "awg"]
     running: true
     onExited: function(exitCode) {
       root._awgPresent = exitCode === 0
@@ -212,9 +224,10 @@ Item {
     }
   }
 
-  Process {
+  VpnProcess {
     id: awgQuickProbe
-    command: ["omarchy-cmd-present", "awg-quick"]
+    objectName: "awgQuickProbe"
+    execCommand: ["omarchy-cmd-present", "awg-quick"]
     running: true
     onExited: function(exitCode) {
       root._awgQuickPresent = exitCode === 0
@@ -225,9 +238,10 @@ Item {
   // `sudo -n` fails immediately instead of prompting when a password would be
   // required, so this exits 0 only when a NOPASSWD sudoers rule already
   // covers awg-quick for this user.
-  Process {
+  VpnProcess {
     id: sudoProbe
-    command: ["sudo", "-n", "awg-quick", "--help"]
+    objectName: "sudoProbe"
+    execCommand: ["sudo", "-n", "awg-quick", "--help"]
     running: false
     onExited: function(exitCode) {
       root._sudoNoPasswd = exitCode === 0
@@ -247,10 +261,13 @@ Item {
   // awg-quick's own directory is scanned alongside the widget's. Its files are
   // normally root-only, so `-r` skips them and the tunnels they start show up
   // through `awg show interfaces` instead; where they are readable, they list.
-  Process {
+  VpnProcess {
     id: listProcess
+    objectName: "listProcess"
+    property int requestGeneration: -1
+    onStarted: requestGeneration = root.statusGeneration
     running: false
-    command: [
+    execCommand: [
       "bash", "-c",
       "shopt -s nullglob; " +
       "mkdir -m 0700 -p " + Util.shellQuote(root.profilesDir) + " 2>/dev/null; " +
@@ -263,7 +280,9 @@ Item {
     stdout: StdioCollector { id: listStdout; waitForEnd: true }
     stderr: StdioCollector { id: listStderr; waitForEnd: true }
     onExited: function(exitCode) {
+      if (listProcess.requestGeneration !== root.statusGeneration) return
       if (exitCode !== 0) {
+        root.statusKnown = false
         root.lastError = Shared.elide(String(listStderr.text || "") || "Could not list AmneziaWG profiles", 140)
         return
       }
@@ -279,13 +298,18 @@ Item {
   // `awg show interfaces` needs no root and reports the up interfaces by name.
   // Status lags a beat after awg-quick returns, so the settle timer re-asks a
   // few times before letting _desired lapse.
-  Process {
+  VpnProcess {
     id: statusProcess
+    objectName: "statusProcess"
+    property int requestGeneration: -1
+    onStarted: requestGeneration = listProcess.requestGeneration
     running: false
-    command: ["awg", "show", "interfaces"]
+    execCommand: ["awg", "show", "interfaces"]
     stdout: StdioCollector { id: statusStdout; waitForEnd: true }
     stderr: StdioCollector { id: statusStderr; waitForEnd: true }
     onExited: function(exitCode) {
+      if (statusProcess.requestGeneration !== root.statusGeneration) return
+      root.statusKnown = exitCode === 0
       if (exitCode === 0) {
         root.upInterfaces = AmneziaWg.parseAwgInterfaces(String(statusStdout.text || ""))
         root.lastError = ""
@@ -304,10 +328,11 @@ Item {
   // Throughput for the up interfaces, from the counters a normal user can read.
   // The config keys that used to be scraped here are read by the model from the
   // listing instead, so this stays two numbers and a name.
-  Process {
+  VpnProcess {
     id: healthProcess
+    objectName: "healthProcess"
     running: false
-    command: [
+    execCommand: [
       "bash", "-c",
       "for iface in $(awg show interfaces 2>/dev/null); do " +
       "[[ \"$iface\" =~ ^[a-zA-Z0-9_.-]+$ ]] || continue; " +
@@ -330,19 +355,20 @@ Item {
     }
   }
 
-  Process {
+  VpnProcess {
     id: connectProcess
+    objectName: "connectProcess"
+    timeoutSeconds: 0
     running: false
-    command: []
+    execCommand: []
     stdout: StdioCollector { id: connectStdout; waitForEnd: true }
     stderr: StdioCollector { id: connectStderr; waitForEnd: true }
     onExited: function(exitCode) {
       var output = String(connectStderr.text || "") + "\n" + String(connectStdout.text || "")
 
-      // The old tunnel is down (or refused to come down, which is not a reason
-      // to swallow the connect the user asked for). Either way, bring up the
-      // one they picked.
-      if (root._stage === "handover") {
+      // Activate the next profile only after a successful teardown. A refusal
+      // must not turn a handover into two competing tunnels.
+      if (root._stage === "handover" && exitCode === 0) {
         root._stage = ""
         chainTimer.restart()
         return
@@ -376,7 +402,7 @@ Item {
         return
       }
       root._stage = "final"
-      connectProcess.command = root.elevate(["up", target.confFile])
+      connectProcess.execCommand = root.elevate(["up", target.confFile])
       connectProcess.running = true
     }
   }
