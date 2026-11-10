@@ -33,6 +33,11 @@ function protonCli(args) {
   ].concat(args || [])
 }
 
+function protonStatusReadable(raw) {
+  return /^\s*Status:\s*(Connected|Disconnected|Connecting)\s*$/mi.test(String(raw || ""))
+    || /^\s*Connected\s+to\s+\S+/mi.test(String(raw || ""))
+}
+
 // Which of the poll's three reads to start now. They used to start together;
 // with the lock above that only buys a queue three deep per monitor, which is
 // long enough for one tick's commands to still be draining when the next tick

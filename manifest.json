@@ -20,12 +20,21 @@
     "defaultSection": "right",
     "defaults": {
       "refreshIntervalSec": 15,
+      "publicIpLookup": "off",
       "preferredBackend": "Auto",
       "favoriteCountries": "CH,NL,US",
       "hiddenBackends": "",
       "profilesDir": "~/.config/omarchy/vpn/awg-profiles"
     },
     "schema": [
+      {
+        "key": "publicIpLookup",
+        "type": "enum",
+        "label": "External public IP lookup",
+        "options": ["off", "on"],
+        "defaultValue": "off",
+        "description": "Opt in to HTTPS requests to checkip.amazonaws.com at startup, when the connection changes, and on refresh. The service sees your current public IP, including when VPN is off."
+      },
       {
         "key": "refreshIntervalSec",
         "type": "integer",

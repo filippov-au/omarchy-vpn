@@ -44,11 +44,15 @@ Item {
   // on position: { "netshield": "malware-only", … }
   property var _lastModes: ({})
 
-  // Optimistic connection state so the switch flips the instant you click it.
-  // -1 follows the CLI, 0/1 while a connect/disconnect is still in flight.
+  // Requested state is kept separate from observations; it never confirms a tunnel.
   property int _desired: -1
+  property bool statusKnown: false
+  property int statusGeneration: 0
+  readonly property bool connectionPending: _desired !== -1
+  readonly property bool mayBeConnected: status.connected || _desired === 1
+  readonly property string connectionState: Shared.connectionState(statusKnown, status.connected, _desired)
 
-  readonly property bool connected: _desired === -1 ? status.connected : (_desired === 1)
+  readonly property bool connected: connectionState === "connected"
   readonly property bool busy: connectProcess.running || statusProcess.running
   readonly property string summary: Proton.protonSummary(status)
   readonly property var details: Proton.protonDetails(status)
@@ -188,7 +192,7 @@ Item {
 
     lastError = ""
     _toggleKey = key
-    toggleProcess.command = Proton.protonCli(args)
+    toggleProcess.execCommand = Proton.protonCli(args)
     toggleProcess.running = true
     pendingTimer.restart()
   }
@@ -226,32 +230,45 @@ Item {
 
   function connectTo(target) {
     if (!detected || connectProcess.running || !target) return
+    settleTimer.stop()
+    statusGeneration += 1
+    statusKnown = false
     _desired = 1
     lastError = ""
     actionStatus = "Connecting to " + target.label + "…"
-    connectProcess.command = Proton.protonCli(["connect"].concat(target.args || []))
+    connectProcess.execCommand = Proton.protonCli(["connect"].concat(target.args || []))
     connectProcess.running = true
   }
 
   function disconnect() {
     if (!detected || connectProcess.running) return
+    settleTimer.stop()
+    statusGeneration += 1
+    statusKnown = false
     _desired = 0
     lastError = ""
     actionStatus = "Disconnecting…"
-    connectProcess.command = Proton.protonCli(["disconnect"])
+    connectProcess.execCommand = Proton.protonCli(["disconnect"])
     connectProcess.running = true
   }
 
   function toggleConnection() {
-    if (connected) disconnect()
+    if (mayBeConnected) disconnect()
     else connectTo({ label: "the fastest server", args: [] })
   }
 
   function applyStatus(raw) {
+    if (!Proton.protonStatusReadable(raw)) {
+      root.statusKnown = false
+      root.lastError = "Could not read Proton VPN status"
+      return false
+    }
     var parsed = Proton.parseProtonStatus(raw)
     root.status = parsed
+    root.statusKnown = true
     // Reality caught up with the pending connect/disconnect — stop overriding.
-    if (_desired !== -1 && parsed.connected === (_desired === 1)) _desired = -1
+    if (!connectProcess.running && _desired !== -1 && parsed.connected === (_desired === 1)) _desired = -1
+    return true
   }
 
   // A command that exits clean but does not take — the CLI accepts it and then
@@ -300,9 +317,10 @@ Item {
     }
   }
 
-  Process {
+  VpnProcess {
     id: detectProcess
-    command: ["omarchy-cmd-present", "protonvpn"]
+    objectName: "detectProcess"
+    execCommand: ["omarchy-cmd-present", "protonvpn"]
     running: true
     onExited: function(exitCode) {
       root._probed = true
@@ -311,12 +329,13 @@ Item {
     }
   }
 
-  Process {
+  VpnProcess {
     id: tunnelProcess
+    objectName: "tunnelProcess"
     running: false
     // Through a shell, so a missing nmcli is exit 127 and the retry path in
     // protonProbe() rather than a process that never starts and never exits.
-    command: ["sh", "-c", "exec nmcli -t -f NAME,STATE connection show --active"]
+    execCommand: ["sh", "-c", "exec nmcli -t -f NAME,STATE connection show --active"]
     stdout: StdioCollector { id: tunnelStdout; waitForEnd: true }
     onExited: function(exitCode) {
       var verdict = Proton.protonProbe({
@@ -334,19 +353,24 @@ Item {
     }
   }
 
-  Process {
+  VpnProcess {
     id: statusProcess
+    objectName: "statusProcess"
+    property int requestGeneration: -1
+    onStarted: requestGeneration = root.statusGeneration
     running: false
-    command: Proton.protonCli(["status"])
+    execCommand: Proton.protonCli(["status"])
     stdout: StdioCollector { id: statusStdout; waitForEnd: true }
     stderr: StdioCollector { id: statusStderr; waitForEnd: true }
     onExited: function(exitCode) {
+      if (statusProcess.requestGeneration !== root.statusGeneration) return
       if (exitCode === 0) {
-        root.applyStatus(String(statusStdout.text || ""))
+        var accepted = root.applyStatus(String(statusStdout.text || ""))
         // Status succeeds while signed out, so clearing unconditionally would
         // wipe the one line telling the user why the panel is empty.
-        root.lastError = root.signedOut ? Proton.PROTON_SIGNIN_HINT : ""
+        if (accepted) root.lastError = root.signedOut ? Proton.PROTON_SIGNIN_HINT : ""
       } else {
+        root.statusKnown = false
         root.lastError = Shared.elide(String(statusStderr.text || statusStdout.text || "") || "Could not read Proton VPN status", 140)
         // Unanswered: the probe retries on its slow clock even if nothing moved.
         root._lastTunnel = null
@@ -355,10 +379,12 @@ Item {
     }
   }
 
-  Process {
+  VpnProcess {
     id: connectProcess
+    objectName: "connectProcess"
+    timeoutSeconds: 180
     running: false
-    command: []
+    execCommand: []
     stdout: StdioCollector { id: connectStdout; waitForEnd: true }
     stderr: StdioCollector { id: connectStderr; waitForEnd: true }
     onExited: function(exitCode) {
@@ -380,10 +406,11 @@ Item {
     }
   }
 
-  Process {
+  VpnProcess {
     id: configProcess
+    objectName: "configProcess"
     running: false
-    command: Proton.protonCli(["config", "list"])
+    execCommand: Proton.protonCli(["config", "list"])
     stdout: StdioCollector { id: configStdout; waitForEnd: true }
     stderr: StdioCollector { id: configStderr; waitForEnd: true }
     onExited: function(exitCode) {
@@ -397,10 +424,11 @@ Item {
     }
   }
 
-  Process {
+  VpnProcess {
     id: toggleProcess
+    objectName: "toggleProcess"
     running: false
-    command: []
+    execCommand: []
     stdout: StdioCollector { id: toggleStdout; waitForEnd: true }
     stderr: StdioCollector { id: toggleStderr; waitForEnd: true }
     onExited: function(exitCode) {
@@ -420,10 +448,11 @@ Item {
   // "Loaded" means asked and answered. A table this parser cannot read is a
   // reason to say so once, not to re-fetch the list on every poll for as long
   // as the shell runs.
-  Process {
+  VpnProcess {
     id: countriesProcess
+    objectName: "countriesProcess"
     running: false
-    command: Proton.protonCli(["countries", "list"])
+    execCommand: Proton.protonCli(["countries", "list"])
     stdout: StdioCollector { id: countriesStdout; waitForEnd: true }
     stderr: StdioCollector { id: countriesStderr; waitForEnd: true }
     onExited: function(exitCode) {

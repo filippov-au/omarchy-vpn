@@ -1,0 +1,5 @@
+pragma Singleton
+import QtQuick
+QtObject {
+  function env(name) { return name === "HOME" ? "/tmp/vpn-test-home" : "" }
+}

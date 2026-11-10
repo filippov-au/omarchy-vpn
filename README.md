@@ -36,8 +36,8 @@ To update later: `omarchy plugin update`. To remove:
 
 ## Using it
 
-The bar icon is dim when nothing is connected and bright when a tunnel is up.
-Hover it to see which one.
+The bar icon is bright only when status confirms a tunnel. Pending changes and
+unavailable status stay dim; hover the icon to see the state.
 
 | Action | Result |
 |--------|--------|
@@ -48,9 +48,8 @@ Hover it to see which one.
 Inside the panel:
 
 - **Public IP** sits top-left. Click it to copy it.
-- **The switch** top-right connects or disconnects. Turning one VPN on shuts
-  every other one off first — you never end up with two tunnels fighting over
-  your routes.
+- **The switch** top-right connects or disconnects. Turning one VPN on disconnects other visible VPN tools first. The new
+  connection is cancelled if their disconnected state cannot be confirmed.
 - **The gear** to its left opens the widget's own settings, which for now is one
   switch per tool found on this machine. Turn one off and the widget forgets it
   entirely: no chip, no polling, and it stops counting toward the bar icon. Turn
@@ -80,8 +79,12 @@ depending on what the cursor is on. `h`/`l` move along the chip row and between
 the gear and the master switch in the header, `s` cycles tools, `/` searches
 countries, `d` disconnects, `r` refreshes, `Esc` closes.
 
-The public IP is fetched from `https://checkip.amazonaws.com` — never on a timer, only
-when the connection changes, when the panel first opens, or when you ask.
+Public-IP lookup is **off by default**. Enable `publicIpLookup` in Setup → Plugins
+if you want HTTPS requests to `https://checkip.amazonaws.com` at startup, on
+connection changes, and on refresh. That service sees your current public IP,
+including your direct IP when VPN is off. The address is informational; it does
+not verify routing, DNS, IPv6, or split-tunnel protection. Stale or failed lookups
+clear the displayed address.
 
 ## Requirements
 
@@ -109,6 +112,7 @@ Configure these in **Setup › Plugins**, or in the widget's entry in
 
 | Setting | Default | What it does |
 |---------|---------|--------------|
+| `publicIpLookup` | `off` | Opt into external public-IP requests (`on`/`off`) |
 | `refreshIntervalSec` | `15` | How often the connection status is polled |
 | `preferredBackend` | `Auto` | Which tool the panel opens on. `Auto` picks whichever is connected |
 | `favoriteCountries` | `CH,NL,US` | Country codes pinned to the top of the Proton VPN and Mullvad lists. Windscribe has no codes, so it matches names instead — see below |
@@ -383,3 +387,19 @@ together and why.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Fork hardening
+
+This fork retains all six VPN backends, including NetworkManager L2TP/IPsec.
+It separates requested from observed connection state, marks failed status
+checks unavailable, bounds background CLI calls, treats dynamic text as plain
+text, and cancels handovers that cannot be confirmed. Interactive credential
+and privilege dialogs are not cut off by a timer.
+
+```bash
+node tests/run.js
+QT_QPA_PLATFORM=offscreen QT_QPA_PLATFORMTHEME=generic QT_QUICK_CONTROLS_STYLE=Basic \
+  /usr/lib/qt6/bin/qmltestrunner -import tests/qml/imports -input tests/qml
+```
+
+QML tests use fake processes and do not connect or disconnect real VPNs.

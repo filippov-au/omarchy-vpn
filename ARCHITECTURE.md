@@ -52,7 +52,10 @@ duck-types, so a backend that omits something simply renders as blank.
 | Property | Meaning |
 |----------|---------|
 | `detected` | Tool is installed and has something to offer. Everything else is ignored until this is true |
-| `connected` | A tunnel is up |
+| `connected` | A fresh observation confirms a tunnel, with no pending connection change |
+| `statusKnown` | The last status request succeeded and belongs to the current operation |
+| `connectionState` | `unknown`, `connecting`, `disconnecting`, `connected`, or `disconnected` |
+| `connectionPending`, `mayBeConnected` | Requested operation; last-known tunnel used to keep disconnect available |
 | `summary` | One line under the hero title |
 | `details` | `[{ label, value }]` rows shown while connected |
 | `targets` | `[{ key, label, detail, glyph, args }]` — the connectable list. A target may also carry `blocked: true`, meaning the backend will refuse it: the panel dims the row, and clicking it still goes through so the refusal can say why |
@@ -127,9 +130,10 @@ if it cannot, the contract is what should change.
 
 **Exclusivity.** Every connect goes through `VpnController.connectVia()` or
 `toggleActive()`, never straight to a backend. Those disconnect every other
-connected backend, wait for them to report down (700ms polls, ~10s cap, then
-proceed anyway so a stuck teardown cannot swallow the user's connect), and only
-then bring the new tunnel up.
+connected or unknown backend, wait for a confirmed disconnected state (700ms
+polls, ~10s cap), and only then bring the new tunnel up. A failure or timeout
+cancels the new connection with an explicit notice. NetworkManager and AmneziaWG
+also stop their internal handover when teardown fails.
 
 Every *disconnect* goes through `disconnectActive()` for the mirror-image
 reason: the connect waiting on that teardown is part of what is being withdrawn,
@@ -140,21 +144,33 @@ matters most when the teardown finished between the click and the next poll, so
 the second connect takes the "nothing to wait for" path and would otherwise
 leave the first one queued behind it.
 
-**Optimistic state.** Both backends keep a `_desired` field: `-1` follows
-reality, `0`/`1` overrides it while a command is in flight. That is what makes
-the switch flip the instant it is clicked instead of waiting a poll cycle.
-Reality reasserts itself once the tool agrees, or after the settle timer gives
-up.
+**Observed and requested state.** Every backend keeps `_desired` separately
+from its last observation. A request invalidates `statusKnown` and advances
+`statusGeneration`; replies from probes started before that generation are
+ignored. `connected` is true only for confirmed observations with no pending
+change. Failed reads retain the old data for disconnect controls and firewall
+warnings, but expose `unknown` and dim the connected icon. A stale reading is
+never silently presented as either a confirmed tunnel or confirmed disconnection.
 
-**Public IP.** Fetched with `curl https://checkip.amazonaws.com`, never polled.
-The scheme is explicit — over plain HTTP anyone on the path could forge the
-address the panel presents as proof the tunnel works — and the response is only
-believed if it parses as an address literal. The
-trigger is `connectionKey` — a string built from the connected backend's id and
-summary — so a connect, a disconnect, or a server switch all invalidate it. A
-2s delay lets routes settle first, since asking too early returns the old
-address. One extra fetch happens at startup, because a shell restart inherits an
-already-up tunnel and no change ever fires.
+**Command deadlines.** `VpnProcess.qml` wraps background commands with coreutils
+`timeout`: 30 seconds for reads, 180 seconds for noninteractive connection
+operations, then SIGTERM and a five-second SIGKILL grace period. The wrapper owns
+the process group, including shell/flock descendants. OpenConnect authentication
+and AmneziaWG elevation remain unbounded because they can be waiting on a person;
+status stays pending/unknown rather than confirming an operation by its exit code.
+
+**Public IP.** Disabled by default. `publicIpLookup: "on"` opts into HTTPS
+requests to `checkip.amazonaws.com` at startup, on connection changes, and on
+manual refresh. Requests have a timeout and a response-size limit. The service
+sees the current public IP, including the direct IP while the VPN is off. This
+is informational, not proof that all traffic or DNS uses a VPN. A generation
+counter rejects replies for obsolete connections or after opt-out; every change
+and failed request clears the previous displayed address.
+
+**Display text.** Plugin-owned `Text` components explicitly use `Text.PlainText`
+for CLI output and profile names. Omarchy-owned hero and tooltip components are
+expected to render their text as plain text too. Do not infer safe rich text
+from a CLI's success exit code.
 
 **Proton status parsing.** The CLI prints plain text, not JSON, and the format
 moves between releases. `parseProtonStatus` matches on the leading key of each
@@ -275,7 +291,7 @@ treats the refusal as inconclusive rather than as news; the next poll asks again
 The same path covers the user running the CLI at a terminal, which is the case
 that cannot be designed away.
 
-A stall timer covers the remaining way for "one at a time" to fail: a job that
+The shared command deadline covers the remaining way for "one at a time" to fail: a job that
 never comes back would hold the runner slot forever, and since a read already in
 flight is never queued twice, the backend would quietly stop asking about the
 tunnel for as long as the shell ran. It **kills** the process rather than
@@ -450,7 +466,7 @@ row rather than emptying the list.
 backends, but NetworkManager will happily run two of its own profiles at once,
 and picking one is never a request for both. So `connectTo` runs two commands
 when something else is up: down the active profile, then up the chosen one. A
-failed teardown still proceeds, for the same reason the controller's does.
+failed teardown cancels activation of the next profile.
 
 **AmneziaWG reads the config, the shell only fetches it.** `awg-quick` has no
 daemon to ask, so everything the panel knows about a profile comes out of the
@@ -547,7 +563,21 @@ of the emulation. `tests/run.js` then runs every `tests/model/*.test.js` it
 finds, so a new backend's tests are picked up by dropping the file in. CI runs
 the same command on push and pull request.
 
-The QML halves are not covered: they are `Process` plumbing and bindings, and
+The original QML halves were not covered: they are `Process` plumbing and bindings, and
 the interesting logic was pushed into `model/` precisely so it could be tested.
 When a bug turns out to live in a parser, the fix belongs there with a case
 beside it.
+
+### Hermetic QML regressions
+
+Run Qt 6 (some distributions expose Qt 5 as `qmltestrunner`):
+
+```bash
+QT_QPA_PLATFORM=offscreen QT_QPA_PLATFORMTHEME=generic QT_QUICK_CONTROLS_STYLE=Basic \
+  /usr/lib/qt6/bin/qmltestrunner -import tests/qml/imports -input tests/qml
+```
+
+The fixture replaces Quickshell processes with controllable replies: it never
+starts a VPN or contacts a provider. It exercises backend bindings, stale status,
+controller handover, opt-in IP requests, and discarded replies. Real-provider
+connectivity and DNS/IPv6 leak tests remain separate manual validation.

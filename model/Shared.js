@@ -1,5 +1,34 @@
 .pragma library
 
+// Only observations can confirm a tunnel. A requested connection and a stale
+// reading must never light the same icon as a confirmed connection.
+function connectionState(known, observed, desired) {
+  if (desired === 1) return "connecting"
+  if (desired === 0) return "disconnecting"
+  if (!known) return "unknown"
+  return observed ? "connected" : "disconnected"
+}
+
+function canStartExclusive(others) {
+  return others.every(function(backend) {
+    return backend.statusKnown === true && !backend.connected && !backend.connectionPending
+  })
+}
+
+function boundedCommand(command, seconds) {
+  if (!command || command.length === 0) return []
+  // User-driven authentication and elevation dialogs have no fixed deadline.
+  if (seconds === 0) return command.slice()
+  return ["timeout", "--signal=TERM", "--kill-after=5s", String(seconds) + "s"].concat(command)
+}
+
+function publicIpEnabled(value) { return value === "on" }
+
+function acceptPublicIpResult(enabled, startedKey, currentKey) {
+  return enabled === true && startedKey === currentKey
+}
+
+
 // Helpers every backend leans on, and the widget's own settings. Anything here
 // is by definition not one tool's problem: a parser or row-builder that only
 // one backend calls belongs in that backend's file instead.

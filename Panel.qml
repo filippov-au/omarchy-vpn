@@ -102,7 +102,9 @@ Panel {
       if (vpn.detectedBackends.length > 0) return "Every VPN tool is hidden. Turn one back on with the gear."
       return vpn.setupHint !== "" ? vpn.setupHint : root.installHint
     }
-    return backend.actionStatus !== "" ? backend.actionStatus : backend.lastError
+    if (backend.actionStatus !== "") return backend.actionStatus
+    if (backend.lastError !== "") return backend.lastError
+    return backend.connectionState === "unknown" ? "Connection status unavailable" : ""
   }
 
   function ensureCursor() {
@@ -564,6 +566,7 @@ Panel {
                 spacing: Style.space(6)
 
                 Text {
+                  textFormat: Text.PlainText
                   text: "Public IP:"
                   color: root.dim
                   font.family: root.fontFamily
@@ -571,7 +574,8 @@ Panel {
                 }
 
                 Text {
-                  text: vpn.ipFetching
+                  textFormat: Text.PlainText
+                  text: !vpn.publicIpLookup ? "Disabled" : vpn.ipFetching
                     ? "Checking…"
                     : (vpn.publicIp !== "" ? vpn.publicIp : (vpn.ipFailed ? "unavailable" : "—"))
                   color: ipLabel.copyable ? root.foreground : root.dim
@@ -620,7 +624,7 @@ Panel {
               // calls toggleActive(), which acts on the selected backend — a
               // switch reading "on" because a *different* tool is connected
               // would take that tunnel down and bring this one up instead.
-              checked: root.backend ? root.backend.connected : false
+              checked: root.backend ? root.backend.mayBeConnected : false
               busy: root.backend ? root.backend.busy : false
               hasCursor: root.switchHasCursor
               foreground: root.foreground
@@ -672,12 +676,13 @@ Panel {
               anchors.leftMargin: Style.space(4)
               anchors.rightMargin: Style.space(4)
               title: root.backend ? root.backend.label : "VPN"
-              meta: root.backend ? root.backend.summary : "Nothing detected"
+              meta: root.backend ? (root.backend.statusKnown ? root.backend.summary : "Connection status unavailable") : "Nothing detected"
               foreground: root.foreground
               fontFamily: root.fontFamily
               iconOpacity: vpn.anyConnected ? 1.0 : 0.5
               iconComponent: Component {
                 Text {
+                  textFormat: Text.PlainText
                   text: root.backend ? root.backend.glyph : Shared.GLYPH_VPN
                   color: vpn.anyConnected ? root.foreground : root.dim
                   font.family: root.fontFamily
@@ -686,6 +691,7 @@ Panel {
               }
               trailingControl: Component {
                 Text {
+                  textFormat: Text.PlainText
                   visible: root.settingsAvailable
                   text: root.settingsExpanded ? Shared.GLYPH_CHEVRON_UP : Shared.GLYPH_CHEVRON_DOWN
                   color: root.dim
@@ -712,6 +718,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: root.statusLine !== ""
             width: parent.width
             text: root.statusLine
@@ -820,6 +827,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: root.rows.length === 0
               width: parent.width
               text: {
@@ -897,6 +905,7 @@ Panel {
       spacing: Style.space(8)
 
       Text {
+        textFormat: Text.PlainText
         text: targetRow.row ? targetRow.row.glyph : ""
         color: targetRow.rowMuted ? root.dim : root.foreground
         font.family: root.fontFamily
@@ -910,6 +919,7 @@ Panel {
         spacing: Style.space(1)
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           text: targetRow.row ? targetRow.row.label : ""
           color: targetRow.rowMuted ? root.dim : root.foreground
@@ -919,6 +929,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           visible: targetRow.row && targetRow.row.detail !== ""
           text: targetRow.row ? targetRow.row.detail : ""
@@ -930,6 +941,7 @@ Panel {
       }
 
       Text {
+        textFormat: Text.PlainText
         visible: targetRow.isCurrent
         text: Shared.GLYPH_CHECK
         color: root.foreground
@@ -982,6 +994,7 @@ Panel {
         spacing: Style.space(1)
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           text: toggleRow.entry ? toggleRow.entry.label : ""
           color: root.foreground
@@ -991,6 +1004,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           visible: toggleRow.entry && toggleRow.entry.detail !== ""
           text: toggleRow.entry ? toggleRow.entry.detail : ""
@@ -1025,6 +1039,7 @@ Panel {
   }
 
   component InfoLabel: Text {
+    textFormat: Text.PlainText
     color: root.foreground
     opacity: 0.6
     font.family: root.fontFamily
@@ -1032,6 +1047,7 @@ Panel {
   }
 
   component InfoValue: Text {
+    textFormat: Text.PlainText
     color: root.foreground
     font.family: root.fontFamily
     font.pixelSize: Style.font.bodySmall
